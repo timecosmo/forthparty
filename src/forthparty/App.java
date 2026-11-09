@@ -544,11 +544,33 @@ public final class App {
         }
     }
 
-    public static void main(String[] args) throws Exception {
-        Store store = new Store(Path.of(args.length > 0 ? args[0] : "data"));
+    public static void main(String[] args) {
+        Path dataDir = args.length > 0 ? Path.of(args[0]) : defaultDataDir();
         SwingUtilities.invokeLater(() -> {
-            Theme.apply("dark".equals(store.setting("theme", "light")), null);
-            new App(store).frame.setVisible(true);
+            try {
+                Store store = new Store(dataDir);
+                Theme.apply("dark".equals(store.setting("theme", "light")), null);
+                new App(store).frame.setVisible(true);
+            } catch (Exception e) {
+                // jar를 더블클릭해서 실행하면 콘솔이 없으므로 오류를 창으로 보여준다
+                JOptionPane.showMessageDialog(null, "forthparty를 시작할 수 없습니다.\n" + e + "\n\n데이터 폴더: " + dataDir,
+                        "forthparty", JOptionPane.ERROR_MESSAGE);
+                System.exit(1);
+            }
         });
+    }
+
+    /**
+     * 데이터 폴더 위치: 프로그램 파일 바로 옆의 data 폴더.
+     * jar로 실행하면 forthparty.jar가 있는 폴더, 컴파일한 클래스(out 폴더)로 실행하면 프로젝트 폴더 기준.
+     * 더블클릭 실행은 '현재 폴더'가 어디로 잡힐지 모르기 때문에 이렇게 정한다.
+     */
+    private static Path defaultDataDir() {
+        try {
+            Path location = Path.of(App.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+            return location.getParent().resolve("data");
+        } catch (Exception e) {
+            return Path.of("data");
+        }
     }
 }

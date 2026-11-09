@@ -2,9 +2,16 @@
 
 서버 없이 내 PC에만 저장하는 개인 맵 메모장. **게임 목록 → 맵 목록 → 맵 마킹** 3단계.
 
-## 실행 (JDK 17+)
-- Windows: `run.bat`
-- macOS/Linux: `./run.sh`
+## 실행
+자바 17 이상이 설치되어 있어야 합니다.
+
+**가장 쉬운 방법:** `forthparty.jar`를 더블클릭합니다.
+- `forthparty.jar`는 반드시 `data` 폴더와 같은 폴더에 두세요. 마커와 지도는 `data` 폴더에 저장됩니다.
+- 더블클릭해도 안 열리면 명령 창에서 `java -jar forthparty.jar`로 실행해 보세요.
+
+**소스에서 바로 실행:** Windows `run.bat`, macOS/Linux `./run.sh`
+
+**코드를 고친 뒤 jar 다시 만들기:** Windows `build-jar.bat`, macOS/Linux `./build-jar.sh`
 
 ## 사용법
 | 화면 | 동작 |
