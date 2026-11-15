@@ -123,6 +123,17 @@ final class Store {
         Files.copy(source, mapsDir(m.gameId()).resolve(m.id() + "." + ext), StandardCopyOption.REPLACE_EXISTING);
     }
 
+    /** 클립보드에서 붙여넣은 이미지를 PNG로 저장 (기존 이미지는 교체) */
+    void setImage(GameMap m, java.awt.image.BufferedImage image) throws IOException {
+        for (String e : IMAGE_EXTS) Files.deleteIfExists(mapsDir(m.gameId()).resolve(m.id() + "." + e));
+        javax.imageio.ImageIO.write(image, "png", mapsDir(m.gameId()).resolve(m.id() + ".png").toFile());
+    }
+
+    static boolean isImageFile(Path p) {
+        String n = p.getFileName().toString().toLowerCase(Locale.ROOT);
+        return Arrays.stream(IMAGE_EXTS).anyMatch(e -> n.endsWith("." + e));
+    }
+
     // ------------------------------------------------------------ 공유 (서버 없이 파일로)
 
     /** 맵 하나(이름 + 마커 + 쓰인 마커 종류 + 이미지)를 .fpmap 파일 하나로 내보냄 */

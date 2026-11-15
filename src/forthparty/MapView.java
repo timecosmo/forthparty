@@ -2,7 +2,9 @@ package forthparty;
 
 import javax.swing.*;
 import java.awt.*;
+import java.awt.datatransfer.DataFlavor;
 import java.awt.event.*;
+import java.awt.geom.AffineTransform;
 import java.awt.geom.Ellipse2D;
 import java.awt.image.BufferedImage;
 import java.util.*;
@@ -11,7 +13,8 @@ import java.util.function.Function;
 
 /**
  * 맵 이미지 + 마커 뷰어.
- * 휠: 확대/축소(커서 기준) · 빈 곳 드래그: 지도 이동 · 마커 드래그: 마커 옮기기
+ * 휠: 부드러운 확대/축소(커서 기준) · 빈 곳 드래그: 지도 이동(놓으면 미끄러지듯 멈춤) · 마커 드래그: 마커 옮기기
+ * 이미지 파일을 끌어다 놓으면 지도 이미지로 지정
  * 마커 더블클릭: 편집 · 빈 곳 더블클릭: 원래 크기 · 우클릭: 추가/편집/삭제 메뉴
  *
  * 마커를 실제로 바꾸는 일(저장, 되돌리기 기록, 편집 창)은 App이 맡고, 이 클래스는 화면과 마우스만 다룬다.
@@ -26,6 +29,7 @@ final class MapView extends JComponent {
         void add(MarkerType type, double x, double y);    // 우클릭 메뉴에서 추가
         void edit(int index);                             // 편집 (더블클릭 또는 메뉴)
         void delete(int index);                           // 삭제 (메뉴)
+        void imageDropped(java.io.File file);             // 이미지 파일을 끌어다 놓음
     }
 
     private BufferedImage img;
@@ -40,7 +44,18 @@ final class MapView extends JComponent {
     private int hovered = -1;
     private Actions actions;
 
+    // 화면 상태(zoom, pan)는 목표값(tZoom, tPan)을 향해 매 프레임 조금씩 다가간다 → 부드러운 확대와 이동
+    private static final double MAX_ZOOM = 24, OVERSCROLL = 80;
     private double zoom = 1, panX, panY;
+    private double tZoom = 1, tPanX, tPanY;
+    private long lastStep;
+    private final javax.swing.Timer anim = new javax.swing.Timer(1000 / 60, e -> step());
+    // 지도를 끌다 놓았을 때의 속도 (px/ms) → 관성으로 조금 더 미끄러짐
+    private double velX, velY;
+    private long lastDragTime;
+    private Point lastDragPoint;
+    // 축소 화면을 선명하고 빠르게 그리기 위한 1/2, 1/4, ... 크기 이미지
+    private final List<BufferedImage> levels = new ArrayList<>();
     private Point dragStart;
     private double dragPanX, dragPanY;
     private int dragIndex = -1;      // 드래그 중인 마커
@@ -57,10 +72,22 @@ final class MapView extends JComponent {
                 dragStart = e.getPoint();
                 dragPanX = panX;
                 dragPanY = panY;
+                velX = velY = 0;
+                lastDragPoint = e.getPoint();
+                lastDragTime = System.nanoTime();
+                if (dragIndex < 0) stopAnimation(); // 미끄러지는 중에 잡으면 그 자리에서 멈춤
             }
             @Override public void mouseReleased(MouseEvent e) {
                 if (e.isPopupTrigger()) popup(e);
                 if (dragIndex >= 0 && dragMoved && actions != null) actions.moved(markers);
+                // 지도를 빠르게 끌다 놓으면 그 방향으로 조금 더 미끄러진다
+                boolean flick = dragIndex < 0 && dragStart != null && img != null
+                        && (System.nanoTime() - lastDragTime) < 80_000_000L && Math.hypot(velX, velY) > 0.2;
+                if (flick) {
+                    tPanX = limitPan(panX + velX * 220, img.getWidth() * scale(), getWidth());
+                    tPanY = limitPan(panY + velY * 220, img.getHeight() * scale(), getHeight());
+                    animate();
+                }
                 dragIndex = -1;
                 dragStart = null;
                 setCursor(Cursor.getDefaultCursor());
@@ -78,8 +105,14 @@ final class MapView extends JComponent {
                     dragMoved = true;
                     setCursor(Cursor.getPredefinedCursor(Cursor.MOVE_CURSOR));
                 } else {
-                    panX = dragPanX + e.getX() - dragStart.x;
-                    panY = dragPanY + e.getY() - dragStart.y;
+                    panX = tPanX = limitPan(dragPanX + e.getX() - dragStart.x, img.getWidth() * scale(), getWidth());
+                    panY = tPanY = limitPan(dragPanY + e.getY() - dragStart.y, img.getHeight() * scale(), getHeight());
+                    long now = System.nanoTime();
+                    double dt = Math.max(1, (now - lastDragTime) / 1e6);
+                    velX = velX * 0.5 + (e.getX() - lastDragPoint.x) / dt * 0.5;
+                    velY = velY * 0.5 + (e.getY() - lastDragPoint.y) / dt * 0.5;
+                    lastDragTime = now;
+                    lastDragPoint = e.getPoint();
                 }
                 repaint();
             }
@@ -95,22 +128,33 @@ final class MapView extends JComponent {
             @Override public void mouseClicked(MouseEvent e) {
                 if (!SwingUtilities.isLeftMouseButton(e) || e.getClickCount() != 2) return;
                 int m = markerAt(e.getPoint());
-                if (m >= 0 && actions != null) actions.edit(m); else resetView();
+                if (m >= 0 && actions != null) actions.edit(m); else fit();
             }
             @Override public void mouseWheelMoved(MouseWheelEvent e) {
-                if (img == null) return;
-                double s0 = scale();
-                double ix = (e.getX() - originX()) / s0, iy = (e.getY() - originY()) / s0;
-                zoom = Math.max(1, Math.min(16, zoom * (e.getWheelRotation() < 0 ? 1.25 : 0.8)));
-                double s1 = scale();
-                panX = e.getX() - ix * s1 - (getWidth() - img.getWidth() * s1) / 2;
-                panY = e.getY() - iy * s1 - (getHeight() - img.getHeight() * s1) / 2;
-                repaint();
+                // 터치패드처럼 조금씩 굴리는 입력도 그만큼만 확대되도록 정밀 회전값 사용
+                zoomAt(e.getX(), e.getY(), Math.pow(1.25, -e.getPreciseWheelRotation()));
             }
         };
         addMouseListener(mouse);
         addMouseMotionListener(mouse);
         addMouseWheelListener(mouse);
+
+        // 탐색기에서 이미지 파일을 끌어다 놓으면 지도 이미지로 지정
+        setTransferHandler(new TransferHandler() {
+            @Override public boolean canImport(TransferSupport t) { return t.isDataFlavorSupported(DataFlavor.javaFileListFlavor); }
+            @Override public boolean importData(TransferSupport t) {
+                if (!canImport(t) || actions == null) return false;
+                try {
+                    List<?> files = (List<?>) t.getTransferable().getTransferData(DataFlavor.javaFileListFlavor);
+                    if (files.isEmpty()) return false;
+                    java.io.File f = (java.io.File) files.get(0);
+                    SwingUtilities.invokeLater(() -> actions.imageDropped(f));
+                    return true;
+                } catch (Exception e) {
+                    return false;
+                }
+            }
+        });
     }
 
     // ------------------------------------------------------------ App이 부르는 메서드
@@ -121,8 +165,19 @@ final class MapView extends JComponent {
         this.markersEnabled = markersEnabled;
         this.emptyText = emptyText;
         hovered = -1;
-        resetView();
+        buildLevels(img);
+        stopAnimation();
+        zoom = tZoom = 1;
+        panX = panY = tPanX = tPanY = 0;
+        repaint();
     }
+
+    /** 화면 가운데를 기준으로 확대/축소 (단축키용) */
+    void zoomIn() { zoomAt(getWidth() / 2.0, getHeight() / 2.0, 1.5); }
+    void zoomOut() { zoomAt(getWidth() / 2.0, getHeight() / 2.0, 1 / 1.5); }
+
+    /** 지도 전체가 보이는 크기로 부드럽게 돌아감 */
+    void fit() { tZoom = 1; tPanX = tPanY = 0; animate(); }
 
     /** 게임이 바뀌면 종류 목록(우클릭 메뉴)과 id → 종류 찾는 방법을 새로 받는다 */
     void setTypes(List<MarkerType> menuTypes, Function<String, MarkerType> resolver) {
@@ -144,7 +199,76 @@ final class MapView extends JComponent {
 
     // ------------------------------------------------------------ 좌표 계산
 
-    private void resetView() { zoom = 1; panX = panY = 0; repaint(); }
+    /** (px, py) 아래의 지도 지점이 그대로 그 자리에 있도록 확대/축소 목표를 정한다 */
+    private void zoomAt(double px, double py, double factor) {
+        if (img == null) return;
+        double s0 = scale();
+        double ix = (px - originX()) / s0, iy = (py - originY()) / s0;   // 커서 아래의 이미지 좌표
+        tZoom = Math.max(1, Math.min(MAX_ZOOM, tZoom * factor));
+        double s1 = scale() / zoom * tZoom;                               // 목표 배율
+        tPanX = limitPan(px - ix * s1 - (getWidth() - img.getWidth() * s1) / 2, img.getWidth() * s1, getWidth());
+        tPanY = limitPan(py - iy * s1 - (getHeight() - img.getHeight() * s1) / 2, img.getHeight() * s1, getHeight());
+        animate();
+    }
+
+    /** 지도가 화면 밖으로 사라지지 않게 이동 범위를 제한. 지도가 화면보다 작으면 가운데 고정 */
+    private static double limitPan(double pan, double imageSize, double viewSize) {
+        double extra = imageSize - viewSize;
+        if (extra <= 0) return 0;
+        double max = extra / 2 + OVERSCROLL;
+        return Math.max(-max, Math.min(max, pan));
+    }
+
+    private void animate() {
+        if (!anim.isRunning()) { lastStep = System.nanoTime(); anim.start(); }
+    }
+
+    private void stopAnimation() {
+        anim.stop();
+        tZoom = zoom; tPanX = panX; tPanY = panY;
+    }
+
+    /** 한 프레임: 현재값을 목표값 쪽으로 일정 비율만큼 옮긴다 (처음엔 빠르게, 끝에선 천천히) */
+    private void step() {
+        long now = System.nanoTime();
+        double dt = Math.min(0.05, (now - lastStep) / 1e9);
+        lastStep = now;
+        double f = 1 - Math.exp(-dt * 14);
+        // 세 값을 같은 비율로 옮기므로 확대 중에도 커서 아래 지점이 흔들리지 않는다
+        zoom += (tZoom - zoom) * f;
+        panX += (tPanX - panX) * f;
+        panY += (tPanY - panY) * f;
+        if (Math.abs(tZoom - zoom) < 0.001 * zoom && Math.abs(tPanX - panX) < 0.4 && Math.abs(tPanY - panY) < 0.4) {
+            zoom = tZoom; panX = tPanX; panY = tPanY;
+            anim.stop();
+        }
+        repaint();
+    }
+
+    /** 원본과 1/2, 1/4 ... 크기 이미지를 미리 만들어 둔다. 축소해서 볼 때 가장 가까운 크기를 골라 그린다 */
+    private void buildLevels(BufferedImage src) {
+        if (src != null && src == source) return;   // 같은 이미지면 다시 만들지 않음
+        levels.clear();
+        source = src;
+        if (src == null) return;
+        // 화면에 빨리 그릴 수 있는 형식으로 한 번 변환
+        int type = src.getColorModel().hasAlpha() ? BufferedImage.TYPE_INT_ARGB : BufferedImage.TYPE_INT_RGB;
+        BufferedImage cur = new BufferedImage(src.getWidth(), src.getHeight(), type);
+        Graphics2D g = cur.createGraphics();
+        g.drawImage(src, 0, 0, null);
+        g.dispose();
+        levels.add(cur);
+        while (cur.getWidth() > 600 && cur.getHeight() > 600 && levels.size() < 6) {
+            BufferedImage half = new BufferedImage((cur.getWidth() + 1) / 2, (cur.getHeight() + 1) / 2, type);
+            Graphics2D hg = half.createGraphics();
+            hg.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            hg.drawImage(cur, 0, 0, half.getWidth(), half.getHeight(), null);
+            hg.dispose();
+            levels.add(half);
+            cur = half;
+        }
+    }
+    private BufferedImage source;
     private static double clamp(double v) { return Math.max(0, Math.min(1, v)); }
 
     private double scale() {
@@ -222,7 +346,15 @@ final class MapView extends JComponent {
         }
         g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
         double s = scale();
-        g.drawImage(img, (int) originX(), (int) originY(), (int) (img.getWidth() * s), (int) (img.getHeight() * s), null);
+        // 지금 배율에 가장 가까운 크기의 이미지를 골라 그린다 (축소해도 자글거리지 않고 빠름)
+        int k = 0;
+        while (k + 1 < levels.size() && s * (1 << (k + 1)) <= 1.0) k++;
+        BufferedImage level = levels.get(k);
+        AffineTransform at = new AffineTransform();
+        at.translate(originX(), originY());   // 소수점 좌표 그대로 그려야 움직일 때 떨리지 않는다
+        at.scale(img.getWidth() * s / level.getWidth(), img.getHeight() * s / level.getHeight());
+        g.drawImage(level, at, null);
+        if (zoom > 1.01) drawZoomChip(g);
         if (!markersEnabled) { g.dispose(); return; }
 
         List<Integer> labelled = new ArrayList<>();
@@ -252,6 +384,18 @@ final class MapView extends JComponent {
         if (hovered >= 0 && hovered < markers.size() && !labelled.contains(hovered)) labelled.add(hovered);
         for (int i : labelled) drawLabel(g, markers.get(i), i == hovered);
         g.dispose();
+    }
+
+    /** 오른쪽 아래의 현재 배율 표시 */
+    private void drawZoomChip(Graphics2D g) {
+        String text = Math.round(zoom * 100) + "%";
+        FontMetrics fm = g.getFontMetrics();
+        int w = fm.stringWidth(text) + 14, h = fm.getHeight() + 4;
+        int x = getWidth() - w - 10, y = getHeight() - h - 10;
+        g.setColor(new Color(0, 0, 0, 150));
+        g.fillRoundRect(x, y, w, h, h, h);
+        g.setColor(Color.WHITE);
+        g.drawString(text, x + 7, y + 2 + fm.getAscent());
     }
 
     /** 마커 이름표. 마우스를 올린 마커는 메모도 함께 보여준다 */

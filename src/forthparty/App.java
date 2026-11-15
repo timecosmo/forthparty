@@ -249,6 +249,7 @@ public final class App {
             public void add(MarkerType type, double x, double y) { addMarker(type, x, y); }
             public void edit(int index) { editMarker(index); }
             public void delete(int index) { deleteMarker(index); }
+            public void imageDropped(java.io.File file) { setImageFromFile(file.toPath()); }
         });
 
         JPanel p = new JPanel(new BorderLayout(0, 6));
@@ -261,6 +262,10 @@ public final class App {
         bind(p, "ctrl Z", this::undo);
         bind(p, "ctrl Y", this::redo);
         bind(p, "ctrl shift Z", this::redo);
+        bind(p, "ctrl V", this::pasteImage);
+        for (String k : new String[]{"ctrl EQUALS", "ctrl ADD", "ctrl shift EQUALS"}) bind(p, k, mapView::zoomIn);
+        for (String k : new String[]{"ctrl MINUS", "ctrl SUBTRACT"}) bind(p, k, mapView::zoomOut);
+        for (String k : new String[]{"ctrl 0", "ctrl NUMPAD0"}) bind(p, k, mapView::fit);
         return p;
     }
 
@@ -269,7 +274,7 @@ public final class App {
         viewTitle.setText(game.name() + "  ›  " + m.name());
         applyGameTypes();
         mapView.setContent(image(m), m.markers(), true,
-                "맵 이미지가 없습니다\n오른쪽 위 '맵 이미지 지정…'으로 맵 스크린샷을 넣어주세요");
+                "맵 이미지가 없습니다\n\n게임 지도를 캡처한 뒤 여기서 Ctrl+V 로 붙여넣거나\n이미지 파일을 이 화면에 끌어다 놓으세요\n(오른쪽 위 '맵 이미지 지정…'으로 파일을 고를 수도 있습니다)");
         undo.clear();
         redo.clear();
         markerSearch.setText("");
@@ -328,7 +333,7 @@ public final class App {
         if (message != null) sb.append(message).append("   ·   ");
         if (!q.isEmpty()) sb.append("'").append(q).append("' 일치 ")
                 .append(map.markers().stream().filter(m -> MapView.hit(m, game.type(m.typeId()), q)).count()).append("개   ·   ");
-        sb.append("마커 ").append(map.markers().size()).append("개   ·   우클릭: 추가   ·   드래그: 옮기기   ·   더블클릭: 편집   ·   ")
+        sb.append("마커 ").append(map.markers().size()).append("개   ·   우클릭: 추가   ·   드래그: 옮기기   ·   더블클릭: 편집   ·   휠: 확대   ·   ")
                 .append("Ctrl+Z: 되돌리기").append(undo.isEmpty() ? "" : " (" + undo.size() + ")").append("   ·   Ctrl+F: 검색");
         viewStatus.setText(sb.toString());
     }
@@ -419,9 +424,54 @@ public final class App {
         JFileChooser fc = new JFileChooser();
         fc.setFileFilter(new FileNameExtensionFilter("이미지 (png, jpg, gif)", "png", "jpg", "jpeg", "gif"));
         if (fc.showOpenDialog(frame) != JFileChooser.APPROVE_OPTION) return;
-        save(() -> store.setImage(map, fc.getSelectedFile().toPath()));
+        setImageFromFile(fc.getSelectedFile().toPath());
+    }
+
+    /** 파일 선택 또는 끌어다 놓기로 받은 이미지 파일을 지도로 지정 */
+    private void setImageFromFile(Path file) {
+        if (!VIEW.equals(screen)) return;
+        if (!Store.isImageFile(file)) { error(new Exception("png, jpg, gif 이미지 파일만 넣을 수 있습니다")); return; }
+        if (!confirmReplaceImage()) return;
+        save(() -> store.setImage(map, file));
+        reloadImage("지도 이미지를 지정했습니다");
+    }
+
+    /** Ctrl+V: 클립보드의 캡처 이미지(또는 복사한 이미지 파일)를 지도로 지정 */
+    private void pasteImage() {
+        if (!VIEW.equals(screen)) return;
+        try {
+            var clip = Toolkit.getDefaultToolkit().getSystemClipboard();
+            if (clip.isDataFlavorAvailable(java.awt.datatransfer.DataFlavor.imageFlavor)) {
+                Image img = (Image) clip.getData(java.awt.datatransfer.DataFlavor.imageFlavor);
+                BufferedImage copy = new BufferedImage(img.getWidth(null), img.getHeight(null), BufferedImage.TYPE_INT_RGB);
+                Graphics2D g = copy.createGraphics();
+                g.drawImage(img, 0, 0, null);
+                g.dispose();
+                if (!confirmReplaceImage()) return;
+                store.setImage(map, copy);
+                reloadImage("붙여넣은 이미지를 지도로 지정했습니다");
+            } else if (clip.isDataFlavorAvailable(java.awt.datatransfer.DataFlavor.javaFileListFlavor)) {
+                List<?> files = (List<?>) clip.getData(java.awt.datatransfer.DataFlavor.javaFileListFlavor);
+                if (!files.isEmpty()) setImageFromFile(((java.io.File) files.get(0)).toPath());
+            } else {
+                updateViewStatus("클립보드에 이미지가 없습니다 (지도를 캡처한 뒤 Ctrl+V)");
+            }
+        } catch (Exception e) { error(e); }
+    }
+
+    /** 이미 지도와 마커가 있으면, 실수로 바꾸지 않도록 한 번 물어본다 */
+    private boolean confirmReplaceImage() {
+        if (store.imageFor(map).isEmpty() || map.markers().isEmpty()) return true;
+        return JOptionPane.showConfirmDialog(frame,
+                "이 맵에는 이미 지도 이미지와 마커 " + map.markers().size() + "개가 있습니다.\n"
+                        + "다른 구도의 이미지로 바꾸면 마커 위치가 지도와 어긋날 수 있습니다. 바꿀까요?",
+                "지도 이미지 바꾸기", JOptionPane.YES_NO_OPTION) == JOptionPane.YES_OPTION;
+    }
+
+    private void reloadImage(String message) {
         imageCache.remove(key(map));
         mapView.setContent(image(map), map.markers(), true, "이미지를 읽을 수 없습니다");
+        updateViewStatus(message);
     }
 
     private BufferedImage image(GameMap m) {
