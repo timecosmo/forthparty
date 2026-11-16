@@ -22,6 +22,14 @@ import java.util.function.Function;
 final class MapView extends JComponent {
     private static final Color BG = new Color(0x1E1F22);
     private static final int R = 8;
+    // 매 프레임 새로 만들지 않도록 미리 만들어 두는 그리기 도구
+    private static final Color OUTLINE = new Color(0, 0, 0, 200);
+    private static final Stroke OUTLINE_STROKE = new BasicStroke(1.6f), RING_STROKE = new BasicStroke(3f);
+    private static final Composite DIM = AlphaComposite.getInstance(AlphaComposite.SRC_OVER, 0.3f);
+    private static final Shape RING = new Ellipse2D.Double(-R - 7, -R - 7, 2 * (R + 7), 2 * (R + 7));
+    /** 모양별 도형 (원점 기준). 그릴 때는 좌표만 옮겨서 재사용한다 */
+    private static final Map<MarkerType.Form, Shape> SHAPES = new EnumMap<>(MarkerType.Form.class);
+    static { for (MarkerType.Form f : MarkerType.Form.values()) SHAPES.put(f, MarkerType.outline(f, 0, 0, R)); }
 
     /** App이 받아서 처리하는 사용자 동작 */
     interface Actions {
@@ -43,6 +51,8 @@ final class MapView extends JComponent {
     private final Set<String> hidden = new HashSet<>();
     private int hovered = -1;
     private Actions actions;
+    /** 마커별 검색 일치 여부. 검색어·마커·종류가 바뀔 때만 다시 계산한다 (그릴 때마다 계산하면 느림) */
+    private boolean[] hits = new boolean[0];
 
     // 화면 상태(zoom, pan)는 목표값(tZoom, tPan)을 향해 매 프레임 조금씩 다가간다 → 부드러운 확대와 이동
     private static final double MAX_ZOOM = 24, OVERSCROLL = 80;
@@ -139,6 +149,19 @@ final class MapView extends JComponent {
         addMouseMotionListener(mouse);
         addMouseWheelListener(mouse);
 
+        // 창 크기가 바뀌면 지도가 이동 범위를 벗어나지 않게 다시 맞춘다
+        addComponentListener(new ComponentAdapter() {
+            @Override public void componentResized(ComponentEvent e) {
+                if (img == null || getWidth() == 0 || getHeight() == 0) return;
+                double fit = scale() / zoom;
+                panX = limitPan(panX, img.getWidth() * fit * zoom, getWidth());
+                panY = limitPan(panY, img.getHeight() * fit * zoom, getHeight());
+                tPanX = limitPan(tPanX, img.getWidth() * fit * tZoom, getWidth());
+                tPanY = limitPan(tPanY, img.getHeight() * fit * tZoom, getHeight());
+                repaint();
+            }
+        });
+
         // 탐색기에서 이미지 파일을 끌어다 놓으면 지도 이미지로 지정
         setTransferHandler(new TransferHandler() {
             @Override public boolean canImport(TransferSupport t) { return t.isDataFlavorSupported(DataFlavor.javaFileListFlavor); }
@@ -165,6 +188,8 @@ final class MapView extends JComponent {
         this.markersEnabled = markersEnabled;
         this.emptyText = emptyText;
         hovered = -1;
+        dragIndex = -1;
+        refreshHits();
         buildLevels(img);
         stopAnimation();
         zoom = tZoom = 1;
@@ -183,13 +208,20 @@ final class MapView extends JComponent {
     void setTypes(List<MarkerType> menuTypes, Function<String, MarkerType> resolver) {
         this.menuTypes = menuTypes;
         this.types = resolver;
+        refreshHits();
         repaint();
     }
 
-    void setMarkers(List<Marker> markers) { this.markers = markers; hovered = -1; repaint(); }
+    void setMarkers(List<Marker> markers) { this.markers = markers; hovered = -1; refreshHits(); repaint(); }
     void setActions(Actions a) { actions = a; }
     void setShowLabels(boolean v) { showLabels = v; repaint(); }
-    void setHighlight(String q) { highlight = q == null ? "" : q.trim(); repaint(); }
+    void setHighlight(String q) { highlight = q == null ? "" : q.trim(); refreshHits(); repaint(); }
+
+    private void refreshHits() {
+        hits = new boolean[markers.size()];
+        if (highlight.isEmpty()) return;
+        for (int i = 0; i < hits.length; i++) hits[i] = hit(markers.get(i), types.apply(markers.get(i).typeId()), highlight);
+    }
     void setTypeVisible(String typeId, boolean v) { if (v) hidden.remove(typeId); else hidden.add(typeId); repaint(); }
 
     /** 검색어가 마커 이름·메모·종류 이름 중 하나와 맞는지 */
@@ -201,7 +233,7 @@ final class MapView extends JComponent {
 
     /** (px, py) 아래의 지도 지점이 그대로 그 자리에 있도록 확대/축소 목표를 정한다 */
     private void zoomAt(double px, double py, double factor) {
-        if (img == null) return;
+        if (img == null || getWidth() == 0 || getHeight() == 0) return;
         double s0 = scale();
         double ix = (px - originX()) / s0, iy = (py - originY()) / s0;   // 커서 아래의 이미지 좌표
         tZoom = Math.max(1, Math.min(MAX_ZOOM, tZoom * factor));
@@ -251,12 +283,8 @@ final class MapView extends JComponent {
         levels.clear();
         source = src;
         if (src == null) return;
-        // 화면에 빨리 그릴 수 있는 형식으로 한 번 변환
-        int type = src.getColorModel().hasAlpha() ? BufferedImage.TYPE_INT_ARGB : BufferedImage.TYPE_INT_RGB;
-        BufferedImage cur = new BufferedImage(src.getWidth(), src.getHeight(), type);
-        Graphics2D g = cur.createGraphics();
-        g.drawImage(src, 0, 0, null);
-        g.dispose();
+        BufferedImage cur = toFastFormat(src);
+        int type = cur.getType();
         levels.add(cur);
         while (cur.getWidth() > 600 && cur.getHeight() > 600 && levels.size() < 6) {
             BufferedImage half = new BufferedImage((cur.getWidth() + 1) / 2, (cur.getHeight() + 1) / 2, type);
@@ -269,6 +297,17 @@ final class MapView extends JComponent {
         }
     }
     private BufferedImage source;
+
+    /** 화면에 빨리 그릴 수 있는 형식(INT_RGB / INT_ARGB)으로 변환. 이미 그 형식이면 복사하지 않고 그대로 쓴다 */
+    static BufferedImage toFastFormat(BufferedImage src) {
+        int type = src.getColorModel().hasAlpha() ? BufferedImage.TYPE_INT_ARGB : BufferedImage.TYPE_INT_RGB;
+        if (src.getType() == type) return src;
+        BufferedImage out = new BufferedImage(src.getWidth(), src.getHeight(), type);
+        Graphics2D g = out.createGraphics();
+        g.drawImage(src, 0, 0, null);
+        g.dispose();
+        return out;
+    }
     private static double clamp(double v) { return Math.max(0, Math.min(1, v)); }
 
     private double scale() {
@@ -359,29 +398,36 @@ final class MapView extends JComponent {
 
         List<Integer> labelled = new ArrayList<>();
         boolean searching = !highlight.isEmpty();
+        // 좌표 계산에 쓰는 값은 한 번만 구한다
+        double ox = originX(), oy = originY(), iw = img.getWidth() * s, ih = img.getHeight() * s;
+        int w = getWidth(), h = getHeight(), margin = R + 12;
+        AffineTransform base = g.getTransform();
         for (int i = 0; i < markers.size(); i++) {
             Marker m = markers.get(i);
             if (!visible(m)) continue;
+            double x = ox + m.x() * iw, y = oy + m.y() * ih;
+            if (x < -margin || y < -margin || x > w + margin || y > h + margin) continue;   // 화면 밖 마커는 그리지 않음
             MarkerType t = types.apply(m.typeId());
-            double x = sx(m), y = sy(m);
-            boolean hl = searching && hit(m, t, highlight);
+            boolean hl = searching && i < hits.length && hits[i];
             if (showLabels || hl) labelled.add(i);
             // 검색 중이면 맞는 마커만 또렷하게, 나머지는 흐리게
-            g.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, searching && !hl ? 0.3f : 1f));
+            g.setComposite(searching && !hl ? DIM : AlphaComposite.SrcOver);
+            g.translate(x, y);
             if (hl || i == dragIndex) {
                 g.setColor(Color.WHITE);
-                g.setStroke(new BasicStroke(3f));
-                g.draw(new Ellipse2D.Double(x - R - 7, y - R - 7, 2 * (R + 7), 2 * (R + 7)));
+                g.setStroke(RING_STROKE);
+                g.draw(RING);
             }
-            Shape shape = MarkerType.outline(t.form(), x, y, R);
+            Shape shape = SHAPES.get(t.form());
             g.setColor(t.color());
             g.fill(shape);
-            g.setColor(new Color(0, 0, 0, 200));
-            g.setStroke(new BasicStroke(1.6f));
+            g.setColor(OUTLINE);
+            g.setStroke(OUTLINE_STROKE);
             g.draw(shape);
+            g.setTransform(base);
         }
         g.setComposite(AlphaComposite.SrcOver);
-        if (hovered >= 0 && hovered < markers.size() && !labelled.contains(hovered)) labelled.add(hovered);
+        if (hovered >= 0 && hovered < markers.size() && visible(markers.get(hovered)) && !labelled.contains(hovered)) labelled.add(hovered);
         for (int i : labelled) drawLabel(g, markers.get(i), i == hovered);
         g.dispose();
     }

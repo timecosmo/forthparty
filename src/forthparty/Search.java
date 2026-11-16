@@ -15,7 +15,12 @@ final class Search {
     }
 
     private static String norm(String s) {
-        return s.toLowerCase(Locale.ROOT).replaceAll("\\s+", "");
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (!Character.isWhitespace(c)) sb.append(Character.toLowerCase(c));
+        }
+        return sb.toString();
     }
 
     private static final char[] CHO = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ".toCharArray();

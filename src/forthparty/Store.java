@@ -119,14 +119,29 @@ final class Store {
     void setImage(GameMap m, Path source) throws IOException {
         String fn = source.getFileName().toString();
         String ext = fn.substring(fn.lastIndexOf('.') + 1).toLowerCase(Locale.ROOT);
-        for (String e : IMAGE_EXTS) Files.deleteIfExists(mapsDir(m.gameId()).resolve(m.id() + "." + e));
-        Files.copy(source, mapsDir(m.gameId()).resolve(m.id() + "." + ext), StandardCopyOption.REPLACE_EXISTING);
+        Path target = mapsDir(m.gameId()).resolve(m.id() + "." + ext);
+        // 이미 이 맵의 이미지인 파일을 다시 고른 경우: 지우고 복사하면 원본이 사라지므로 아무것도 하지 않는다
+        if (Files.exists(target) && Files.isSameFile(source, target)) return;
+        // 새 파일을 임시 이름으로 먼저 복사한 뒤 교체 → 도중에 실패해도 기존 이미지가 남는다
+        Path tmp = target.resolveSibling(target.getFileName() + ".tmp");
+        Files.copy(source, tmp, StandardCopyOption.REPLACE_EXISTING);
+        replaceImage(m, tmp, target);
+    }
+
+    private void replaceImage(GameMap m, Path tmp, Path target) throws IOException {
+        for (String e : IMAGE_EXTS) {
+            Path old = mapsDir(m.gameId()).resolve(m.id() + "." + e);
+            if (!old.equals(target)) Files.deleteIfExists(old);
+        }
+        Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
     }
 
     /** 클립보드에서 붙여넣은 이미지를 PNG로 저장 (기존 이미지는 교체) */
     void setImage(GameMap m, java.awt.image.BufferedImage image) throws IOException {
-        for (String e : IMAGE_EXTS) Files.deleteIfExists(mapsDir(m.gameId()).resolve(m.id() + "." + e));
-        javax.imageio.ImageIO.write(image, "png", mapsDir(m.gameId()).resolve(m.id() + ".png").toFile());
+        Path target = mapsDir(m.gameId()).resolve(m.id() + ".png");
+        Path tmp = target.resolveSibling(target.getFileName() + ".tmp");
+        if (!javax.imageio.ImageIO.write(image, "png", tmp.toFile())) throw new IOException("이미지를 저장할 수 없습니다");
+        replaceImage(m, tmp, target);
     }
 
     static boolean isImageFile(Path p) {

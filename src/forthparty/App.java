@@ -22,7 +22,13 @@ public final class App {
     private static final int UNDO_LIMIT = 100;
 
     private final Store store;
-    private final Map<String, Optional<BufferedImage>> imageCache = new HashMap<>();
+    // 지도 이미지는 지금 보고 있는 맵 하나만 메모리에 둔다 (큰 이미지가 맵마다 쌓이지 않게)
+    private String loadedKey;
+    private BufferedImage loadedImage;
+    private SwingWorker<BufferedImage, Void> imageLoader;
+    /** 맵 목록에 "이미지 없음"을 표시하기 위한 정보. 목록을 열 때 한 번만 디스크를 확인한다 */
+    private final Set<String> mapsWithImage = new HashSet<>();
+    private static final String NO_IMAGE_HINT = "맵 이미지가 없습니다\n\n게임 지도를 캡처한 뒤 여기서 Ctrl+V 로 붙여넣거나\n이미지 파일을 이 화면에 끌어다 놓으세요\n(오른쪽 위 '맵 이미지 지정…'으로 파일을 고를 수도 있습니다)";
 
     private final JFrame frame = new JFrame("forthparty");
     private final CardLayout cards = new CardLayout();
@@ -131,7 +137,7 @@ public final class App {
         mapsScreen.list.setCellRenderer(new DefaultListCellRenderer() {
             @Override public Component getListCellRendererComponent(JList<?> l, Object v, int i, boolean s, boolean f) {
                 GameMap m = (GameMap) v;
-                String extra = (store.imageFor(m).isPresent() ? "" : "  · 이미지 없음")
+                String extra = (mapsWithImage.contains(m.id()) ? "" : "  · 이미지 없음")
                         + (m.markers().isEmpty() ? "" : "  · 마커 " + m.markers().size());
                 super.getListCellRendererComponent(l, m.name() + extra, i, s, f);
                 setBorder(BorderFactory.createEmptyBorder(8, 12, 8, 12));
@@ -153,7 +159,7 @@ public final class App {
         mapsScreen.onDelete = m -> {
             if (confirm("'" + m.name() + "' 맵과 마커 " + m.markers().size() + "개를 삭제할까요?")) {
                 save(() -> store.deleteMap(m));
-                imageCache.remove(key(m));
+                if (key(m).equals(loadedKey)) { loadedKey = null; loadedImage = null; }
                 openMaps(game);
             }
         };
@@ -164,7 +170,12 @@ public final class App {
     private void openMaps(Game g) {
         try { game = store.loadGame(g.id()); } catch (Exception e) { game = g; }
         mapsScreen.title.setText(game.name());
-        try { mapsScreen.setItems(store.listMaps(game)); } catch (Exception e) { error(e); }
+        try {
+            List<GameMap> maps = store.listMaps(game);
+            mapsWithImage.clear();
+            for (GameMap m : maps) if (store.imageFor(m).isPresent()) mapsWithImage.add(m.id());
+            mapsScreen.setItems(maps);
+        } catch (Exception e) { error(e); }
         mapsScreen.hint.setText("Enter 또는 더블클릭으로 열기 · Esc 뒤로");
         switchTo(MAPS);
         mapsScreen.list.requestFocusInWindow();
@@ -273,8 +284,7 @@ public final class App {
         map = m;
         viewTitle.setText(game.name() + "  ›  " + m.name());
         applyGameTypes();
-        mapView.setContent(image(m), m.markers(), true,
-                "맵 이미지가 없습니다\n\n게임 지도를 캡처한 뒤 여기서 Ctrl+V 로 붙여넣거나\n이미지 파일을 이 화면에 끌어다 놓으세요\n(오른쪽 위 '맵 이미지 지정…'으로 파일을 고를 수도 있습니다)");
+        loadImage(null);
         undo.clear();
         redo.clear();
         markerSearch.setText("");
@@ -432,8 +442,9 @@ public final class App {
         if (!VIEW.equals(screen)) return;
         if (!Store.isImageFile(file)) { error(new Exception("png, jpg, gif 이미지 파일만 넣을 수 있습니다")); return; }
         if (!confirmReplaceImage()) return;
-        save(() -> store.setImage(map, file));
-        reloadImage("지도 이미지를 지정했습니다");
+        try { store.setImage(map, file); } catch (Exception e) { error(e); return; }
+        loadedKey = null;
+        loadImage("지도 이미지를 지정했습니다");
     }
 
     /** Ctrl+V: 클립보드의 캡처 이미지(또는 복사한 이미지 파일)를 지도로 지정 */
@@ -447,9 +458,12 @@ public final class App {
                 Graphics2D g = copy.createGraphics();
                 g.drawImage(img, 0, 0, null);
                 g.dispose();
-                if (!confirmReplaceImage()) return;
+                if (img.getWidth(null) <= 0 || !confirmReplaceImage()) return;
                 store.setImage(map, copy);
-                reloadImage("붙여넣은 이미지를 지도로 지정했습니다");
+                // 방금 붙여넣은 이미지를 그대로 화면에 쓴다 (저장한 파일을 다시 읽지 않음)
+                loadedKey = key(map);
+                loadedImage = copy;
+                loadImage("붙여넣은 이미지를 지도로 지정했습니다");
             } else if (clip.isDataFlavorAvailable(java.awt.datatransfer.DataFlavor.javaFileListFlavor)) {
                 List<?> files = (List<?>) clip.getData(java.awt.datatransfer.DataFlavor.javaFileListFlavor);
                 if (!files.isEmpty()) setImageFromFile(((java.io.File) files.get(0)).toPath());
@@ -468,16 +482,41 @@ public final class App {
                 "지도 이미지 바꾸기", JOptionPane.YES_NO_OPTION) == JOptionPane.YES_OPTION;
     }
 
-    private void reloadImage(String message) {
-        imageCache.remove(key(map));
-        mapView.setContent(image(map), map.markers(), true, "이미지를 읽을 수 없습니다");
-        updateViewStatus(message);
-    }
-
-    private BufferedImage image(GameMap m) {
-        return imageCache.computeIfAbsent(key(m), k -> store.imageFor(m).map(p -> {
-            try { return ImageIO.read(p.toFile()); } catch (Exception e) { return null; }
-        })).orElse(null);
+    /**
+     * 현재 맵의 지도 이미지를 화면에 올린다.
+     * 큰 이미지는 읽는 데 시간이 걸리므로 별도 스레드에서 읽고, 그동안 화면이 멈추지 않게 "불러오는 중"을 보여준다.
+     */
+    private void loadImage(String message) {
+        if (imageLoader != null) imageLoader.cancel(false);
+        GameMap target = map;
+        String k = key(target);
+        if (k.equals(loadedKey)) {                       // 이미 메모리에 있는 이미지
+            mapView.setContent(loadedImage, target.markers(), true, "이미지를 읽을 수 없습니다");
+            if (message != null) updateViewStatus(message);
+            return;
+        }
+        loadedKey = null;
+        loadedImage = null;                              // 이전 맵의 이미지는 메모리에서 내려놓는다
+        Optional<Path> file = store.imageFor(target);
+        if (file.isEmpty()) { mapView.setContent(null, target.markers(), true, NO_IMAGE_HINT); return; }
+        mapView.setContent(null, target.markers(), true, "지도를 불러오는 중…");
+        imageLoader = new SwingWorker<>() {
+            @Override protected BufferedImage doInBackground() throws Exception {
+                BufferedImage raw = ImageIO.read(file.get().toFile());
+                return raw == null ? null : MapView.toFastFormat(raw);
+            }
+            @Override protected void done() {
+                // 읽는 사이에 다른 맵으로 갔으면 버린다
+                if (isCancelled() || map == null || !k.equals(key(map))) return;
+                BufferedImage img = null;
+                try { img = get(); } catch (Exception ignored) { }
+                loadedKey = k;
+                loadedImage = img;
+                mapView.setContent(img, map.markers(), true, "이미지를 읽을 수 없습니다");
+                if (message != null) updateViewStatus(message);
+            }
+        };
+        imageLoader.execute();
     }
 
     private static String key(GameMap m) { return m.gameId() + "/" + m.id(); }
